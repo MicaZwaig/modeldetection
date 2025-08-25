@@ -58,8 +58,8 @@
     .gauge .center .big{ font-size:1.75rem; font-weight:800; }
     .gauge .center .small{ color:var(--muted); font-size:.9rem; }
     .legend{ display:grid; gap:10px; }
-    .metric-row{ display:grid; grid-template-columns: 160px 1fr auto; gap:10px; align-items:center; }
-    .metric-row .name{ color:var(--muted); font-size:.9rem; }
+    .metric-row{ display:grid; grid-template-columns: 160px 1fr auto; gap:10px; align-items:center; position:relative; }
+    .metric-row .name{ color:var(--muted); font-size:.9rem; cursor:help; }
     .metric-row .bar{ height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; }
     .metric-row .bar > span{ display:block; height:100%; width:0%; background:linear-gradient(90deg, var(--warning), var(--danger)); }
     .metric-row .val{ font-weight:700; }
@@ -70,6 +70,21 @@
     .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .mini{ font-size:.8rem; color:var(--muted); }
     .slider{ width:220px; }
+
+    /* Tooltip flotante global */
+    #metricTooltip{
+      position:fixed; top:0; left:0; z-index:9999;
+      background:rgba(13,18,38,.98);
+      color:var(--text);
+      border:1px solid var(--card-strong);
+      box-shadow:var(--shadow);
+      border-radius:10px; padding:.6rem .75rem;
+      font-size:.85rem; max-width:320px;
+      opacity:0; transform: translateY(-4px) scale(.98);
+      pointer-events:none; transition:.12s ease;
+      white-space:normal; overflow-wrap:anywhere;
+    }
+    #metricTooltip.show{ opacity:1; transform: translateY(0) scale(1); }
   </style>
   <!-- ORT Web (ONNXRuntime) -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
@@ -115,16 +130,14 @@
           <span id="thresVal">60%</span>
         </div>
 
-        <!-- NUEVO: selector de perfil -->
         <div class="row mini">
           Perfil:
           <select id="profile">
             <option value="balanced">Equilibrado</option>
-            <option value="aggressive">Agresivo (IA realista)</option>
+            <option value="aggressive" selected>Agresivo (IA realista)</option>
           </select>
         </div>
       </div>
-
 
       <div style="margin-top:16px" class="video-wrap">
         <video id="video" controls crossorigin="anonymous"></video>
@@ -135,7 +148,7 @@
       </div>
 
       <div style="margin-top:10px" class="tip">
-        Este modo usa: <em>modelo IA ONNX (si carga)</em> + <em>blink-rate</em>, <em>sincronía labios–audio</em>, <em>DCT alta frecuencia</em>, <em>consistencia de piel</em>, <em>bloques de compresión</em>, y <em>pistas del nombre del archivo</em>.
+        Este modo usa: <em>modelo IA ONNX (si carga)</em> + <em>parpadeo</em>, <em>sincronía labios–audio</em>, <em>DCT alta frecuencia</em>, <em>consistencia de piel</em>, <em>compresión</em>, <em>nitidez</em>, <em>saturación</em> y <em>pistas del nombre</em>.
       </div>
     </section>
 
@@ -165,15 +178,14 @@
       </div>
     </aside>
   </main>
-<!-- 
-  <footer>
-    Demo educativa. Todo corre localmente. Podés reemplazar el modelo ONNX por otro (Xception/EfficientNet distil) ubicado en <code>CFG.modelUrl</code>.
-  </footer> -->
 
   <!-- Work canvases -->
   <canvas id="work" width="320" height="180" style="display:none"></canvas>
   <canvas id="face" width="224" height="224" style="display:none"></canvas>
   <canvas id="blur" width="160" height="90" style="display:none"></canvas>
+
+  <!-- Tooltip global -->
+  <div id="metricTooltip" role="tooltip" aria-hidden="true"></div>
 
   <script>
   // ================== Config ==================
@@ -205,7 +217,7 @@
   const stOnnx = $('#status-onnx');
   const stFace = $('#status-face');
   const profileSel = $('#profile');
-
+  const tooltip = $('#metricTooltip');
 
   let currentFile = null;
   let lastReport = null;
@@ -268,7 +280,7 @@
     analyzeBtn.disabled = true; exportBtn.disabled = true; legendEl.innerHTML='';
     try{
       const report = await analyzeVideo(video, (p)=> bar.style.width = p + '%');
-      lastReport = report; exportBtn.disabled = true === false; renderReport(report);
+      lastReport = report; exportBtn.disabled = false; renderReport(report);
     }catch(err){ console.error(err); alert('Error procesando el video: '+ err.message); }
     finally{ analyzeBtn.disabled = false; }
   });
@@ -279,152 +291,174 @@
     const {frames, times} = await captureFrames(video, fps, maxFrames, duration, onProgress);
     if(frames.length < 6) throw new Error('Muy pocos cuadros para analizar');
 
-    // Per-frame core stats
-    // Series base existentes
+    // Series
     const per = [];
     const earSeries = [];
     const marSeries = [];
-
-    // Series nuevas
-    const noiseSeries = [];     // RMS de residuo HF por frame
-    const faceContrastSeries = []; // contraste local en cara (si hay patch)
+    const noiseSeries = [];
+    const faceContrastSeries = [];
+    const satMeanSeries = [];
+    const satP95Series  = [];
 
     for (let i=0;i<frames.length;i++){
       const img = frames[i];
       const base = frameStats(img);
 
+      // Saturación global
+      const sat = saturationStats(img);
+      satMeanSeries.push(sat.meanS);
+      satP95Series.push(sat.p95S);
+
+      // Landmarks/cara
       let ear=null, mar=null, facePatch=null;
       if (faceReady) {
         const faceInfo = detectFace(img);
         if (faceInfo){ ear=faceInfo.ear; mar=faceInfo.mar; facePatch=faceInfo.patch; }
       }
 
+      // ONNX
       let onnxProb = null;
       if (modelReady && facePatch){ onnxProb = await runOnnx(facePatch); }
 
-      const dctHF = facePatch ? dctHighFreq(facePatch) : dctHighFreq(img); // fallback al frame si no hay cara
+      // DCT y piel
+      const dctHFv = facePatch ? dctHighFreq(facePatch) : dctHighFreq(img);
       const skinVar = facePatch ? skinChromVar(facePatch) : 0;
 
-      // NUEVO: ruido HF del frame (independiente de cara)
+      // Ruido HF global
       const nRms = frameNoiseRMS(img);
       noiseSeries.push(nRms);
 
-      // NUEVO: contraste local de la cara (si hay patch)
+      // Contraste local en cara
       if (facePatch) faceContrastSeries.push(localContrast(facePatch));
 
-      per.push({ ...base, onnxProb, dctHF, skinVar });
+      per.push({ ...base, onnxProb, dctHF: dctHFv, skinVar });
       if (ear!==null) earSeries.push(ear);
       if (mar!==null) marSeries.push(mar);
+      if(onProgress) onProgress(Math.round(((i+1)/frames.length)*100));
     }
 
-    // Vectores escalarizados ya existentes
+    // Vectores
     const meanY = per.map(p=>p.meanY);
     const block = per.map(p=>p.blockiness);
     const sharp = per.map(p=>p.lapEnergy);
     const dctHF = per.map(p=>p.dctHF);
 
-    // Movimiento temporal (ya tenías esta función)
-    const motion = temporalMotion(frames);
-
-    // Estadísticos de “variabilidad” (para detectar perfección)
+    // Variabilidad temporal (“perfección”)
     const vBright = stdDev(diff(meanY));
     const vBlock  = stdDev(block);
     const vSharp  = stdDev(sharp);
-    const vMotion = stdDev(motion);
+    const vSat    = stdDev(satMeanSeries);
     const meanNoise = mean(noiseSeries);
     const vNoise  = stdDev(noiseSeries);
-    const meanFaceContrast = faceContrastSeries.length? mean(faceContrastSeries) : null;
-// Perfil
-const prof = (profileSel?.value || 'balanced');
+    const faceContrMean = faceContrastSeries.length ? mean(faceContrastSeries) : null;
 
-// 4.1 Flicker de brillo -> ahora U-shape (muy bajo o muy alto = riesgo)
-const flickerRisk = uShape(vBright, /*lo*/ 0.6, /*hi*/ 3.4);
-const flickerRiskAgg = uShape(vBright, 0.4, 2.6);
+    // Contraste global (muestrar 3 frames)
+    const sampleIdx = [0, Math.floor(frames.length/2), frames.length-1].filter(i=>i>=0);
+    let globalContrastSd = 0, globalRange = 0;
+    if(sampleIdx.length){
+      const vals = sampleIdx.map(i => contrastGlobal(frames[i]));
+      globalContrastSd = mean(vals.map(v=>v.sd));
+      globalRange = mean(vals.map(v=>v.range));
+    }
 
-// 4.2 Blockiness: alto promedio O excesivamente uniforme en el tiempo
-const blockMeanRisk = uShape(mean(block), 0.6, 2.0);           // como antes
-const blockUniformRisk = scale( 1 - vBlock, 0.0, 0.6 );        // var muy baja = riesgo
-const blockinessRisk = Math.max(blockMeanRisk, blockUniformRisk);
+    // Bitrate aproximado (info)
+    const bitrate = approxBitratebps(currentFile, duration);
 
-// 4.3 Nitidez: U-shape + uniformidad excesiva
-const sharpMeanRisk = uShape(mean(sharp), 15, 45);
-const sharpUniformRisk = scale( 1 - vSharp, 0.0, 2.0 );
-const sharpnessRisk = Math.max(sharpMeanRisk, sharpUniformRisk);
+    // ====== Riesgos (sin movimiento) ======
+    const prof = (profileSel?.value || 'aggressive');
 
-// 4.4 Inestabilidad de movimiento: penaliza tanto jitter alto como "demasiado perfecto"
-const motionJitterRisk = uShape(vMotion, 3.0, 15.0);
+    // Flicker: U‑shape (muy bajo o muy alto = riesgo). Perfil agresivo es más sensible a “demasiado bajo”.
+    const flickerRisk = uShape(vBright, 0.6, 3.4);
+    const flickerRiskAgg = uShape(vBright, 0.4, 2.6);
 
-// 4.5 DCT alta frecuencia (igual que antes, pero con fallback arriba)
-const dctRisk = clamp(mean(dctHF),0,1);
+    // Compresión: promedio alto O uniformidad temporal excesiva
+    const blockMeanRisk = uShape(mean(block), 0.6, 2.0);
+    const blockUniformRisk = scale(1 - vBlock, 0.0, 0.6);
+    const blockinessRisk = Math.max(blockMeanRisk, blockUniformRisk);
 
-// 4.6 Ruido de sensor: si el ruido es MUY bajo y MUY constante => riesgo
-// (valores típicos dependen de resolución; estos funcionan bien en 320p preview)
-const noiseLevelRisk = lowRisk(meanNoise, 2.0, 6.0);         // ruido medio bajo → riesgo
-const noiseStabilityRisk = scale( 1 - vNoise, 0.0, 1.2 );    // poca variación temporal → riesgo
-const sensorNoiseRisk = Math.max(noiseLevelRisk, noiseStabilityRisk);
+    // Nitidez: exceso y uniformidad
+    const sharpMeanRisk = uShape(mean(sharp), 12, 36);
+    const sharpUniformRisk = scale(1 - vSharp, 0.0, 1.6);
+    const sharpnessRisk = Math.max(sharpMeanRisk, sharpUniformRisk);
 
-// 4.7 Piel plana (si hay cara): contraste local demasiado bajo + crominancia muy estable
-let skinFlatRisk = 0.3;
-if (meanFaceContrast !== null) {
-  const lowContrast = lowRisk(meanFaceContrast, 6.0, 18.0);  // contraste local bajo
-  const lowChromaVar = lowRisk( mean(per.map(p=>p.skinVar)), 0.12, 0.28 );
-  skinFlatRisk = Math.max(lowContrast, lowChromaVar);
-}
+    // DCT alta frecuencia (caras muy “crosp”/detalladas)
+    const dctRisk = clamp(mean(dctHF), 0, 1);
 
-// 4.8 Lipsync (como antes)
-const lipsync = await lipsyncCorrelation(times, marSeries, audioBuffer);
-const lipsyncRisk = lipsync?.risk01 ?? 0.3;
+    // Saturación: nivel/pico altos y MUY estable
+    const satLevelRisk = scale(mean(satMeanSeries), 0.35, 0.7);
+    const satPeakRisk  = scale(mean(satP95Series), 0.6, 0.95);
+    const satStabilityRisk = scale(1 - vSat, 0.0, 0.12);
+    const saturationRisk = Math.max(satLevelRisk, satPeakRisk, satStabilityRisk);
 
-// 4.9 Blink (si hay EAR): igual que antes
-const blink = blinkStats(earSeries, fps);
-const blinkRisk = blink ? blink.risk01 : 0.3;
+    // Contraste global tipo “demo”
+    const globalContrastRisk = scale(globalRange, 60, 150);
 
-// 4.10 Nombre de archivo
-const nameRisk = filenameRisk(currentFile?.name || '');
+    // Ruido de sensor irreal (bajo y estable)
+    const noiseLevelRisk = lowRisk(meanNoise, 2.0, 6.0);
+    const noiseStabilityRisk = scale(1 - vNoise, 0.0, 1.2);
+    const sensorNoiseRisk = Math.max(noiseLevelRisk, noiseStabilityRisk);
 
-// 4.11 ONNX (si está)
-const onnxProb = mean(per.filter(p=>p.onnxProb!=null).map(p=>p.onnxProb)) || null;
+    // Piel plana (cara muy tersa/estable)
+    let skinFlatRisk = 0.3;
+    if (faceContrMean !== null) {
+      const lowContrast = lowRisk(faceContrMean, 6.0, 18.0);
+      const lowChromaVar = lowRisk( mean(per.map(p=>p.skinVar)), 0.12, 0.28 );
+      skinFlatRisk = Math.max(lowContrast, lowChromaVar);
+    }
 
+    // Lipsync / Blink
+    const lipsync = await lipsyncCorrelation(times, marSeries, audioBuffer);
+    const lipsyncRisk = lipsync?.risk01 ?? 0.3;
+    const blink = blinkStats(earSeries, fps);
+    const blinkRisk = blink ? blink.risk01 : 0.3;
 
+    // Nombre de archivo
+    const nameRisk = filenameRisk(currentFile?.name || '');
+
+    // ONNX (si está)
+    const onnxProb = mean(per.filter(p=>p.onnxProb!=null).map(p=>p.onnxProb)) || null;
+
+    // ====== Métricas y pesos ======
     const metrics = [
-  {key:'onnx',   name:'Modelo IA (ONNX)',       val: onnxProb==null?0:onnxProb, desc:'Salida del clasificador ONNX sobre rostro 224×224 (0 real – 1 fake).'},
-  {key:'flicker',name:'Flicker de brillo',      val: (prof==='aggressive'? flickerRiskAgg : flickerRisk), desc:'U‑shape: variación de luminancia muy baja o muy alta es sospechosa.'},
-  {key:'dct',    name:'Alta frecuencia DCT',    val: dctRisk, desc:'Energía relativa en altas frecuencias (texturas/bordes artificiales).'},
-  {key:'motion', name:'Movimiento “perfecto”',  val: motionJitterRisk, desc:'U‑shape: demasiado estable o muy errático puede ser síntesis.'},
-  {key:'block',  name:'Compresión sospechosa',  val: blockinessRisk, desc:'Promedio alto o compresión excesivamente uniforme.'},
-  {key:'sharp',  name:'Nitidez anómala',        val: sharpnessRisk, desc:'Exceso/falta de nitidez o nitidez demasiado estable.'},
-  {key:'sensor', name:'Ruido de sensor',        val: sensorNoiseRisk, desc:'Ruido muy bajo y constante (sin “grano” real) es sospechoso.'},
-  {key:'skin',   name:'Piel plana',             val: skinFlatRisk, desc:'Bajo contraste y crominancia demasiado estable en la cara.'},
-  {key:'lips',   name:'Labios vs audio',        val: lipsyncRisk, desc:'Baja correlación entre actividad oral y energía de voz.'},
-  {key:'blink',  name:'Parpadeo anómalo',       val: blinkRisk, desc:'Frecuencia de parpadeo fuera de lo fisiológico.'},
-  {key:'name',   name:'Pistas del nombre',      val: nameRisk, desc:'Keywords o resoluciones crudas en el nombre del archivo.'}
-];
+      {key:'onnx',   name:'Modelo IA (ONNX)',            val: onnxProb==null?0:onnxProb, desc:'Salida del clasificador ONNX sobre rostro 224×224 (0 real – 1 fake).'},
+      {key:'flicker',name:'Flicker de brillo',           val: (prof==='aggressive'? flickerRiskAgg : flickerRisk), desc:'U‑shape: variación de luminancia muy baja o muy alta es sospechosa.'},
+      {key:'dct',    name:'Alta frecuencia DCT',         val: dctRisk, desc:'Energía relativa en altas frecuencias (texturas/bordes artificiales).'},
+      {key:'block',  name:'Compresión uniforme',         val: blockinessRisk, desc:'Promedio alto o compresión excesivamente uniforme en el tiempo.'},
+      {key:'sharp',  name:'Nitidez “perfecta”',          val: sharpnessRisk, desc:'Exceso/falta de nitidez o nitidez demasiado estable.'},
+      {key:'sat',    name:'Saturación elevada/estable',  val: saturationRisk, desc:'Saturación alta (mean/p95) y muy estable sugiere look sintético.'},
+      {key:'gcontrast', name:'Contraste global alto',    val: globalContrastRisk, desc:'Rango tonal muy amplio típico de “demo reel” o post digital.'},
+      {key:'sensor', name:'Ruido de sensor irreal',      val: sensorNoiseRisk, desc:'Ruido muy bajo y constante (sin “grano” natural) es sospechoso.'},
+      {key:'skin',   name:'Piel plana/estable',          val: skinFlatRisk, desc:'Bajo contraste y crominancia demasiado estable en la cara.'},
+      {key:'lips',   name:'Labios vs audio',             val: lipsyncRisk, desc:'Baja correlación entre actividad oral y energía de voz.'},
+      {key:'blink',  name:'Parpadeo anómalo',            val: blinkRisk, desc:'Frecuencia de parpadeo fuera de lo fisiológico.'},
+      {key:'name',   name:'Pistas del nombre',           val: nameRisk, desc:'Keywords o resoluciones crudas en el nombre del archivo.'}
+    ];
 
-// Pesos por perfil (sin/con ONNX)
-let w;
-if (onnxProb==null) {
-  w = (prof==='aggressive')
-    ? { onnx:0, flicker:.12, dct:.14, motion:.12, block:.12, sharp:.12, sensor:.16, skin:.10, lips:.07, blink:.03, name:.02 }
-    : { onnx:0, flicker:.12, dct:.14, motion:.12, block:.12, sharp:.12, sensor:.12, skin:.10, lips:.08, blink:.07, name:.01 };
-} else {
-  w = (prof==='aggressive')
-    ? { onnx:.50, flicker:.07, dct:.08, motion:.07, block:.05, sharp:.05, sensor:.09, skin:.05, lips:.03, blink:.01, name:.00 }
-    : { onnx:.55, flicker:.06, dct:.07, motion:.06, block:.05, sharp:.05, sensor:.07, skin:.05, lips:.03, blink:.01, name:.00 };
-}
+    let w;
+    if (onnxProb==null) {
+      // Perfil agresivo por defecto: castiga “perfección digital”
+      w = (prof==='aggressive')
+        ? { onnx:0, flicker:.08, dct:.12, block:.12, sharp:.14, sat:.14, gcontrast:.10, sensor:.14, skin:.10, lips:.04, blink:.02, name:.00 }
+        : { onnx:0, flicker:.10, dct:.12, block:.12, sharp:.12, sat:.10, gcontrast:.08, sensor:.12, skin:.10, lips:.08, blink:.06, name:.00 };
+    } else {
+      w = (prof==='aggressive')
+        ? { onnx:.50, flicker:.05, dct:.08, block:.06, sharp:.09, sat:.09, gcontrast:.05, sensor:.06, skin:.05, lips:.03, blink:.02, name:.00 }
+        : { onnx:.55, flicker:.05, dct:.07, block:.05, sharp:.07, sat:.07, gcontrast:.04, sensor:.05, skin:.04, lips:.03, blink:.02, name:.00 };
+    }
 
-// Score
-const score01 = clamp(metrics.reduce((acc,m)=> acc + m.val*(w[m.key]||0), 0), 0, 1);
-const scorePct = Math.round(score01*100);
-const thr = parseInt(thres.value,10);
-const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Incierto' : 'Alta sospecha';
+    const score01 = clamp(metrics.reduce((acc,m)=> acc + m.val*(w[m.key]||0), 0), 0, 1);
+    const scorePct = Math.round(score01*100);
+    const thr = parseInt(thres.value,10);
+    const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Incierto' : 'Alta sospecha';
 
-// Armar reporte como ya hacías
-
-
-    const detail = metrics.map(m=>({ key:m.key, name:m.name, risk01:+m.val.toFixed(3)}));
+    const detail = metrics.map(m=>({ key:m.key, name:m.name, desc:m.desc, risk01:+m.val.toFixed(3)}));
 
     return {
-      summary: { scorePct, label, frames: frames.length, fps, duration:+duration.toFixed(1), threshold: thr, onnx: onnxProb!=null, faceLandmarks: faceReady },
+      summary: {
+        scorePct, label, frames: frames.length, fps, duration:+duration.toFixed(1),
+        threshold: thr, onnx: onnxProb!=null, faceLandmarks: faceReady,
+        bitrate_bps: approxBitratebps(currentFile, duration) ? Math.round(approxBitratebps(currentFile, duration)) : null
+      },
       metrics: detail,
       blink: blink || null,
       lipsync: lipsync || null,
@@ -477,30 +511,28 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
 
   function detectFace(img){
     if(!faceLandmarker) return null;
-    // Draw image data to an offscreen canvas element to use with MediaPipe
+    // Draw image data to an offscreen canvas to use with MediaPipe
     const tmp = document.createElement('canvas'); tmp.width = img.width; tmp.height = img.height; const tctx = tmp.getContext('2d'); tctx.putImageData(img,0,0);
     const res = faceLandmarker.detect(tmp);
     if(!res || !res.faceLandmarks || !res.faceLandmarks[0]) return null;
     const lm = res.faceLandmarks[0];
-    // Compute bbox
+    // BBox
     let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9; for(const p of lm){ const x=p.x*img.width, y=p.y*img.height; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
-    // Expand bbox
     const cx=(minX+maxX)/2, cy=(minY+maxY)/2; let w=maxX-minX, h=maxY-minY; const d=Math.max(w,h)*CFG.faceCropScale; const x0=Math.max(0, Math.round(cx-d/2)), y0=Math.max(0, Math.round(cy-d/2)); const x1=Math.min(img.width, Math.round(cx+d/2)), y1=Math.min(img.height, Math.round(cy+d/2));
-    // Extract face patch 224x224
-    const faceW = x1-x0, faceH=y1-y0; const faceImg = new ImageData(faceW, faceH); // copy pixels
+    // Face patch 224x224
+    const faceW = x1-x0, faceH=y1-y0; const faceImg = new ImageData(faceW, faceH);
     for(let y=0;y<faceH;y++){
       for(let x=0;x<faceW;x++){
-        const srcIdx = ((y0+y)*img.width + (x0+x)) * 4; const dstIdx = (y*faceW + x) * 4; faceImg.data[dstIdx]=img.data[srcIdx]; faceImg.data[dstIdx+1]=img.data[srcIdx+1]; faceImg.data[dstIdx+2]=img.data[srcIdx+2]; faceImg.data[dstIdx+3]=255;
+        const srcIdx = ((y0+y)*img.width + (x0+x)) * 4; const dstIdx = (y*faceW + x) * 4;
+        faceImg.data[dstIdx]=img.data[srcIdx]; faceImg.data[dstIdx+1]=img.data[srcIdx+1]; faceImg.data[dstIdx+2]=img.data[srcIdx+2]; faceImg.data[dstIdx+3]=255;
       }
     }
-    fctx.clearRect(0,0,faceC.width,faceC.height); // draw and resize to 224
+    fctx.clearRect(0,0,faceC.width,faceC.height);
     const tmp2 = document.createElement('canvas'); tmp2.width=faceW; tmp2.height=faceH; const c2=tmp2.getContext('2d'); c2.putImageData(faceImg,0,0); fctx.drawImage(tmp2,0,0,faceC.width,faceC.height);
 
-    // EAR & MAR from landmarks (using MP indexes)
-    // Eye aspect ratio: use 33, 160, 158, 133, 153, 144 (approx for right eye) and mirror for left
+    // EAR/MAR
     const idxsR = [33,160,158,133,153,144]; const idxsL = [362,385,387,263,373,380];
     const earR = eyeAspectRatio(lm, idxsR, img); const earL = eyeAspectRatio(lm, idxsL, img); const ear = (earR+earL)/2;
-    // Mouth aspect ratio: use outer: 78 (left), 308 (right), 13 (top), 14 (bottom)
     const mar = mouthAspectRatio(lm, {L:78, R:308, T:13, B:14}, img);
 
     return { patch: fctx.getImageData(0,0,faceC.width,faceC.height), ear, mar };
@@ -528,7 +560,7 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
     let p=0; for(let y=0;y<H;y++){
       for(let x=0;x<W;x++){
         const idx = (y*width + x) * 4; const r=data[idx]/255, g=data[idx+1]/255, b=data[idx+2]/255;
-        input[p++] = r; // R plane first
+        input[p++] = r;
       }
     }
     for(let y=0;y<H;y++) for(let x=0;x<W;x++){ const idx=(y*width + x)*4; input[p++] = patch.data[idx+1]/255; }
@@ -537,17 +569,15 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
     const feeds = {}; feeds[session.inputNames[0]] = new ort.Tensor('float32', input, [1,3,224,224]);
     try{
       const out = await session.run(feeds); const key = session.outputNames[0]; let val = out[key].data[0];
-      // If model outputs logits, apply sigmoid
-      if(!isFinite(val) || Math.abs(val)>1){ val = 1/(1+Math.exp(-val)); }
+      if(!isFinite(val) || Math.abs(val)>1){ val = 1/(1+Math.exp(-val)); } // logits -> prob
       return clamp(val,0,1);
     }catch{ return null; }
   }
 
   function dctHighFreq(patch){
-    // Compute grayscale 64x64 and 2D DCT, return energy in high frequencies proportion 0..1
+    // Grayscale 64x64 y DCT2, proporción de energía en altas frecuencias (0..1)
     const S=64; const c=document.createElement('canvas'); c.width=S; c.height=S; const ctx=c.getContext('2d'); const tmp=document.createElement('canvas'); tmp.width=patch.width; tmp.height=patch.height; tmp.getContext('2d').putImageData(patch,0,0); ctx.drawImage(tmp,0,0,S,S); const img=ctx.getImageData(0,0,S,S).data;
     const g=new Float32Array(S*S); for(let i=0,j=0;i<img.length;i+=4,j++){ g[j]=0.299*img[i]+0.587*img[i+1]+0.114*img[i+2]; }
-    // naive DCT-II
     const C = new Float32Array(S*S);
     const PI=Math.PI; const alpha = (u)=> u===0? Math.SQRT1_2 : 1;
     for(let u=0;u<S;u++){
@@ -561,45 +591,61 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
   }
 
   function skinChromVar(patch){
-    // Compute variance of chrominance over frames would be better; here per-frame risk via intra-face variance proxy
+    // Varianza de crominancia U/V en la cara (proxy simple)
     const {data,width,height}=patch; const n=width*height; let sumU=0,sumV=0; const U=new Float32Array(n), V=new Float32Array(n);
     for(let i=0,j=0;i<data.length;i+=4,j++){
-      const r=data[i]/255, g=data[i+1]/255, b=data[i+2]/255; // simple YUV
+      const r=data[i]/255, g=data[i+1]/255, b=data[i+2]/255;
       const y=0.299*r+0.587*g+0.114*b; const u=0.492*(b - y); const v=0.877*(r - y); U[j]=u; V[j]=v; sumU+=u; sumV+=v;
     }
     const mU=sumU/n, mV=sumV/n; let sU=0,sV=0; for(let i=0;i<n;i++){ sU+=(U[i]-mU)**2; sV+=(V[i]-mV)**2; }
-    // Higher chroma variance can be suspicious (make it 0..1 via scale)
     return clamp((Math.sqrt(sU/n)+Math.sqrt(sV/n)) / 0.35, 0, 1);
   }
 
-  function temporalMotion(frames){
-    const out=[]; blurC.width=160; blurC.height=Math.round(160/(frames[0].width/frames[0].height)); const ctx= bctx; const tmp=document.createElement('canvas'); tmp.width=frames[0].width; tmp.height=frames[0].height; const tctx=tmp.getContext('2d');
-    for(let i=1;i<frames.length;i++){
-      const a=frames[i-1], b=frames[i]; tctx.putImageData(a,0,0); ctx.filter='blur(1.5px)'; ctx.drawImage(tmp,0,0,blurC.width,blurC.height); const A=ctx.getImageData(0,0,blurC.width,blurC.height).data;
-      tctx.putImageData(b,0,0); ctx.filter='blur(1.5px)'; ctx.drawImage(tmp,0,0,blurC.width,blurC.height); const B=ctx.getImageData(0,0,blurC.width,blurC.height).data; let s=0,n=0; for(let k=0;k<A.length;k+=4){ const y1=0.299*A[k]+0.587*A[k+1]+0.114*A[k+2]; const y2=0.299*B[k]+0.587*B[k+1]+0.114*B[k+2]; s+=Math.abs(y1-y2); n++; } out.push(s/n);
+  // ===== Saturación y contraste global =====
+  function saturationStats(img) {
+    const {data} = img;
+    let sumS = 0; const Svals = [];
+    for (let i=0; i<data.length; i+=4) {
+      const r=data[i]/255, g=data[i+1]/255, b=data[i+2]/255;
+      const max = Math.max(r,g,b), min = Math.min(r,g,b);
+      const v = max; const s = v === 0 ? 0 : (max - min) / v; // HSV
+      sumS += s; Svals.push(s);
     }
-    ctx.filter='none'; return out;
+    Svals.sort((a,b)=>a-b);
+    const p95 = Svals[Math.floor(0.95*(Svals.length-1))] || 0;
+    return { meanS: sumS / (data.length/4), p95S: p95 };
+  }
+
+  function contrastGlobal(img) {
+    const {data} = img;
+    const Y = [];
+    for (let i=0; i<data.length; i+=4) {
+      Y.push(0.299*data[i]+0.587*data[i+1]+0.114*data[i+2]);
+    }
+    const m = Y.reduce((a,b)=>a+b,0)/Y.length;
+    let v=0; for (const y of Y){ const d=y-m; v+=d*d; }
+    const sd = Math.sqrt(v/Math.max(1,Y.length));
+    Y.sort((a,b)=>a-b);
+    const p05 = Y[Math.floor(0.05*(Y.length-1))] || 0;
+    const p95 = Y[Math.floor(0.95*(Y.length-1))] || 0;
+    return { sd, range: p95 - p05 };
   }
 
   // =============== Blink & lipsync ===============
   function blinkStats(earSeries, fps){
     if(!earSeries || earSeries.length<3) return null; const thr=0.21; let blinks=0, lastLow=false; for(const v of earSeries){ const low=v<thr; if(low && !lastLow) blinks++; lastLow=low; }
     const durationMin = earSeries.length / fps / 60; const rate = blinks / Math.max(0.01, durationMin);
-    // Natural blink rate ~ 6–30/min; very bajo o nulo es sospechoso
     let risk = 0; if(rate<3) risk = 0.9; else if(rate<6) risk=0.6; else if(rate>35) risk=0.6; else risk=0.2; return { blinks, ratePerMin: +rate.toFixed(1), risk01: clamp(risk,0,1) };
   }
 
   async function lipsyncCorrelation(times, marSeries, audioBuffer){
     if(!audioBuffer || !marSeries || marSeries.length<6) return null;
-    // Sample RMS audio around each frame time (±40ms)
     const sr = audioBuffer.sampleRate; const ch = audioBuffer.getChannelData(0); const win = Math.floor(0.04*sr);
     const rms=[]; for(const t of times){ const idx=Math.floor(t*sr); let s=0,n=0; for(let i=idx-win;i<=idx+win;i++){ if(i>=0 && i<ch.length){ const v=ch[i]; s+=v*v; n++; } } rms.push(Math.sqrt(s/Math.max(1,n))); }
-    // Normalize sequences
     const a = zscore(marSeries); const b = zscore(rms);
     const corr = pearson(a,b);
-    // If there is speech energy but poor lipsync, flag
     const speechEnergy = mean(rms);
-    const risk = speechEnergy>0.02 ? clamp(0.7 - corr*0.7, 0, 1) : 0.3; // worse corr => higher risk
+    const risk = speechEnergy>0.02 ? clamp(0.7 - corr*0.7, 0, 1) : 0.3;
     return { corr:+corr.toFixed(2), energy:+speechEnergy.toFixed(3), risk01:risk };
   }
 
@@ -610,24 +656,17 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
   const clamp = (x,a,b)=> Math.max(a, Math.min(b, x));
   const scale = (v, lo, hi)=> clamp((v - lo) / (hi - lo), 0, 1);
   const uShape = (v, lo, hi)=>{ if(hi<=lo) return 0; const mid=(lo+hi)/2; const span=(hi-lo)/2; const d=Math.abs(v-mid)/span; return clamp(d,0,1); };
-  const scaleU = (v, lo, hi)=>{ const t = scale(v, lo, hi); return Math.pow(t,0.85); };
   const zscore = arr => { const m=mean(arr), s=stdDev(arr)||1; return arr.map(v=>(v-m)/s); };
   const pearson = (a,b)=>{ const ma=mean(a), mb=mean(b); let num=0,da=0,db=0; for(let i=0;i<a.length;i++){ const x=a[i]-ma, y=b[i]-mb; num+=x*y; da+=x*x; db+=y*y; } return num/Math.sqrt((da||1)*(db||1)); };
 
-  // Normaliza (0..1) diciendo “qué tan bajo” es un valor respecto a un umbral útil
+  // Perfección digital
   const lowRisk = (v, lo, hi) => clamp((hi - v) / Math.max(1e-6, hi - lo), 0, 1);
 
-  // RMS de un vector
-  const rms = arr => Math.sqrt(arr.reduce((a,b)=>a + b*b, 0) / (arr.length||1));
-
-  // High-pass simple para estimar “ruido” del frame (gris)
   function frameNoiseRMS(img) {
     const {data,width:w,height:h}=img;
-    // blur 3x3 + resta -> residuo (alto-frecuencia)
     const toGray = (i)=> 0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
     const g = new Float32Array(w*h);
     for(let i=0,j=0;i<data.length;i+=4,j++) g[j]=toGray(i);
-
     const idx = (x,y)=> y*w+x;
     const out = new Float32Array(w*h);
     for(let y=1;y<h-1;y++){
@@ -637,16 +676,14 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
           g[idx(x-1,y  )] + g[idx(x,y  )] + g[idx(x+1,y  )] +
           g[idx(x-1,y+1)] + g[idx(x,y+1)] + g[idx(x+1,y+1)]
         )/9;
-        out[idx(x,y)] = g[idx(x,y)] - b; // residuo
+        out[idx(x,y)] = g[idx(x,y)] - b; // residuo HF
       }
     }
-    // RMS del residuo (escala 0..255)
     let sum=0,n=0;
     for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++){ const v=out[idx(x,y)]; sum+=v*v; n++; }
     return Math.sqrt(sum/Math.max(1,n));
   }
 
-  // Contraste local aproximado (en cara) usando varianza de luminancia
   function localContrast(facePatch) {
     const {data,width:w,height:h}=facePatch;
     const toGray = (i)=> 0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
@@ -654,12 +691,51 @@ const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Inc
     let s=0; for(let i=0;i<data.length;i+=4) s+=toGray(i);
     const m = s/n;
     let v=0; for(let i=0;i<data.length;i+=4){ const d=toGray(i)-m; v+=d*d; }
-    return Math.sqrt(v/n); // desviación típica (0..255)
+    return Math.sqrt(v/Math.max(1,n));
   }
 
-  // =============== Render ===============
-  function renderReport(rep){ setGauge(rep.summary.scorePct, rep.summary.label); legendEl.innerHTML=''; rep.metrics.forEach(m=> legendEl.appendChild(metricRow(m.name, Math.round(m.risk01*100)))); }
-  function metricRow(name, pct){ const row=document.createElement('div'); row.className='metric-row'; const n=document.createElement('div'); n.className='name'; n.textContent=name; const bar=document.createElement('div'); bar.className='bar'; const fill=document.createElement('span'); fill.style.width=pct+'%'; bar.appendChild(fill); const v=document.createElement('div'); v.className='val'; v.textContent=pct+'%'; row.append(n,bar,v); return row; }
+  function approxBitratebps(file, durationSec){
+    if(!file || !durationSec || durationSec<=0) return null;
+    return (file.size * 8) / durationSec; // bits por segundo
+  }
+
+  // =============== Render + Tooltips ===============
+  function renderReport(rep){
+    setGauge(rep.summary.scorePct, rep.summary.label);
+    legendEl.innerHTML='';
+    rep.metrics.forEach(m=> legendEl.appendChild(metricRow(m.name, Math.round(m.risk01*100), m.desc)));
+  }
+
+  function metricRow(name, pct, desc){
+    const row=document.createElement('div'); row.className='metric-row';
+    const n=document.createElement('div'); n.className='name'; n.textContent=name; n.tabIndex=0;
+    n.addEventListener('mouseenter', (e)=> showTip(desc, e));
+    n.addEventListener('mousemove', (e)=> moveTip(e));
+    n.addEventListener('mouseleave', hideTip);
+    n.addEventListener('focus', (e)=> showTip(desc, e)); // accesible
+    n.addEventListener('blur', hideTip);
+
+    const bar=document.createElement('div'); bar.className='bar';
+    const fill=document.createElement('span'); fill.style.width=pct+'%'; bar.appendChild(fill);
+    const v=document.createElement('div'); v.className='val'; v.textContent=pct+'%';
+    row.append(n,bar,v); return row;
+  }
+
+  function showTip(text, ev){
+    tooltip.textContent = text || '—';
+    tooltip.classList.add('show');
+    moveTip(ev);
+  }
+  function moveTip(ev){
+    const pad=12; const {clientX:x, clientY:y} = ev;
+    const w = tooltip.offsetWidth || 240; const h = tooltip.offsetHeight || 80;
+    let tx = x + 14, ty = y + 14;
+    if(tx + w + pad > window.innerWidth)  tx = x - w - 14;
+    if(ty + h + pad > window.innerHeight) ty = y - h - 14;
+    tooltip.style.left = tx + 'px'; tooltip.style.top = ty + 'px';
+  }
+  function hideTip(){ tooltip.classList.remove('show'); }
+
   function setGauge(pct,label){ pct=Math.round(pct); drawGauge(gaugeCanvas,pct); pctEl.textContent=isFinite(pct)? pct+'%':'—%'; labelEl.textContent=label||'—'; }
   function drawGauge(canvas,pct){ const ctx=canvas.getContext('2d'); const w=canvas.width,h=canvas.height,r=w/2-8,cx=w/2,cy=h/2; ctx.clearRect(0,0,w,h); ctx.lineWidth=12; ctx.strokeStyle='rgba(255,255,255,.12)'; ctx.beginPath(); ctx.arc(cx,cy,r, Math.PI*0.75, Math.PI*2.25); ctx.stroke(); const t=pct/100; const start=Math.PI*0.75; const end=start + t*(Math.PI*1.5); const grad=ctx.createLinearGradient(0,0,w,0); grad.addColorStop(0,'#7aa2ff'); grad.addColorStop(1,'#8af0d6'); ctx.strokeStyle=grad; ctx.lineWidth=12; ctx.lineCap='round'; ctx.beginPath(); ctx.arc(cx,cy,r,start,end); ctx.stroke(); }
 
