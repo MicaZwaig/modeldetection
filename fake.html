@@ -108,12 +108,23 @@
         <button class="btn primary" id="analyzeBtn" disabled>Analizar video</button>
         <button class="btn" id="exportBtn" disabled>Exportar reporte (.json)</button>
         <button class="btn ghost" id="resetBtn">Reiniciar</button>
+
         <div class="row mini">
           Umbral de sospecha:
           <input id="thres" class="slider" type="range" min="30" max="80" value="60"/>
           <span id="thresVal">60%</span>
         </div>
+
+        <!-- NUEVO: selector de perfil -->
+        <div class="row mini">
+          Perfil:
+          <select id="profile">
+            <option value="balanced">Equilibrado</option>
+            <option value="aggressive">Agresivo (IA realista)</option>
+          </select>
+        </div>
       </div>
+
 
       <div style="margin-top:16px" class="video-wrap">
         <video id="video" controls crossorigin="anonymous"></video>
@@ -193,6 +204,8 @@
   const thresVal = $('#thresVal');
   const stOnnx = $('#status-onnx');
   const stFace = $('#status-face');
+  const profileSel = $('#profile');
+
 
   let currentFile = null;
   let lastReport = null;
@@ -267,72 +280,146 @@
     if(frames.length < 6) throw new Error('Muy pocos cuadros para analizar');
 
     // Per-frame core stats
+    // Series base existentes
     const per = [];
-    const earSeries = []; // eye aspect ratio per frame
-    const marSeries = []; // mouth aspect ratio per frame
-    for(let i=0;i<frames.length;i++){
+    const earSeries = [];
+    const marSeries = [];
+
+    // Series nuevas
+    const noiseSeries = [];     // RMS de residuo HF por frame
+    const faceContrastSeries = []; // contraste local en cara (si hay patch)
+
+    for (let i=0;i<frames.length;i++){
       const img = frames[i];
       const base = frameStats(img);
-      let faceProb = null; let ear=null, mar=null; let facePatch = null;
-      if(faceReady){
+
+      let ear=null, mar=null, facePatch=null;
+      if (faceReady) {
         const faceInfo = detectFace(img);
-        if(faceInfo){ ear = faceInfo.ear; mar = faceInfo.mar; facePatch = faceInfo.patch; }
+        if (faceInfo){ ear=faceInfo.ear; mar=faceInfo.mar; facePatch=faceInfo.patch; }
       }
+
       let onnxProb = null;
-      if(modelReady && facePatch){ onnxProb = await runOnnx(facePatch); }
-      const dctHF = facePatch ? dctHighFreq(facePatch) : 0; // 0..1
-      const skinVar = facePatch ? skinChromVar(facePatch) : 0; // 0..1 risk
+      if (modelReady && facePatch){ onnxProb = await runOnnx(facePatch); }
+
+      const dctHF = facePatch ? dctHighFreq(facePatch) : dctHighFreq(img); // fallback al frame si no hay cara
+      const skinVar = facePatch ? skinChromVar(facePatch) : 0;
+
+      // NUEVO: ruido HF del frame (independiente de cara)
+      const nRms = frameNoiseRMS(img);
+      noiseSeries.push(nRms);
+
+      // NUEVO: contraste local de la cara (si hay patch)
+      if (facePatch) faceContrastSeries.push(localContrast(facePatch));
+
       per.push({ ...base, onnxProb, dctHF, skinVar });
-      if(ear!==null) earSeries.push(ear); if(mar!==null) marSeries.push(mar);
+      if (ear!==null) earSeries.push(ear);
+      if (mar!==null) marSeries.push(mar);
     }
 
-    // Temporal features
+    // Vectores escalarizados ya existentes
     const meanY = per.map(p=>p.meanY);
     const block = per.map(p=>p.blockiness);
     const sharp = per.map(p=>p.lapEnergy);
+    const dctHF = per.map(p=>p.dctHF);
 
-    // Motion using blurred diffs
+    // Movimiento temporal (ya tenías esta función)
     const motion = temporalMotion(frames);
 
-    // Blink rate (per minute) from EAR
-    const blink = blinkStats(earSeries, fps);
+    // Estadísticos de “variabilidad” (para detectar perfección)
+    const vBright = stdDev(diff(meanY));
+    const vBlock  = stdDev(block);
+    const vSharp  = stdDev(sharp);
+    const vMotion = stdDev(motion);
+    const meanNoise = mean(noiseSeries);
+    const vNoise  = stdDev(noiseSeries);
+    const meanFaceContrast = faceContrastSeries.length? mean(faceContrastSeries) : null;
+// Perfil
+const prof = (profileSel?.value || 'balanced');
 
-    // Audio–lip sync correlation (if audio exists)
-    const lipsync = await lipsyncCorrelation(times, marSeries, audioBuffer);
+// 4.1 Flicker de brillo -> ahora U-shape (muy bajo o muy alto = riesgo)
+const flickerRisk = uShape(vBright, /*lo*/ 0.6, /*hi*/ 3.4);
+const flickerRiskAgg = uShape(vBright, 0.4, 2.6);
 
-    // Filename risk cues
-    const nameRisk = filenameRisk(currentFile?.name || '');
+// 4.2 Blockiness: alto promedio O excesivamente uniforme en el tiempo
+const blockMeanRisk = uShape(mean(block), 0.6, 2.0);           // como antes
+const blockUniformRisk = scale( 1 - vBlock, 0.0, 0.6 );        // var muy baja = riesgo
+const blockinessRisk = Math.max(blockMeanRisk, blockUniformRisk);
 
-    // Aggregate metrics 0..1
-    const flickerRisk = scaleU(stdDev(diff(meanY)), 1.2, 4.0);
-    const blockinessRisk = uShape(mean(block), 0.6, 2.0);
-    const sharpnessRisk = uShape(mean(sharp), 15, 45);
-    const blinkRisk = blink ? blink.risk01 : 0.3; // neutral if not available
-    const lipsyncRisk = lipsync?.risk01 ?? 0.3;
-    const dctRisk = clamp(mean(per.map(p=>p.dctHF)),0,1);
-    const skinRisk = clamp(mean(per.map(p=>p.skinVar)),0,1);
-    const onnxProb = mean(per.filter(p=>p.onnxProb!=null).map(p=>p.onnxProb)) || null;
+// 4.3 Nitidez: U-shape + uniformidad excesiva
+const sharpMeanRisk = uShape(mean(sharp), 15, 45);
+const sharpUniformRisk = scale( 1 - vSharp, 0.0, 2.0 );
+const sharpnessRisk = Math.max(sharpMeanRisk, sharpUniformRisk);
+
+// 4.4 Inestabilidad de movimiento: penaliza tanto jitter alto como "demasiado perfecto"
+const motionJitterRisk = uShape(vMotion, 3.0, 15.0);
+
+// 4.5 DCT alta frecuencia (igual que antes, pero con fallback arriba)
+const dctRisk = clamp(mean(dctHF),0,1);
+
+// 4.6 Ruido de sensor: si el ruido es MUY bajo y MUY constante => riesgo
+// (valores típicos dependen de resolución; estos funcionan bien en 320p preview)
+const noiseLevelRisk = lowRisk(meanNoise, 2.0, 6.0);         // ruido medio bajo → riesgo
+const noiseStabilityRisk = scale( 1 - vNoise, 0.0, 1.2 );    // poca variación temporal → riesgo
+const sensorNoiseRisk = Math.max(noiseLevelRisk, noiseStabilityRisk);
+
+// 4.7 Piel plana (si hay cara): contraste local demasiado bajo + crominancia muy estable
+let skinFlatRisk = 0.3;
+if (meanFaceContrast !== null) {
+  const lowContrast = lowRisk(meanFaceContrast, 6.0, 18.0);  // contraste local bajo
+  const lowChromaVar = lowRisk( mean(per.map(p=>p.skinVar)), 0.12, 0.28 );
+  skinFlatRisk = Math.max(lowContrast, lowChromaVar);
+}
+
+// 4.8 Lipsync (como antes)
+const lipsync = await lipsyncCorrelation(times, marSeries, audioBuffer);
+const lipsyncRisk = lipsync?.risk01 ?? 0.3;
+
+// 4.9 Blink (si hay EAR): igual que antes
+const blink = blinkStats(earSeries, fps);
+const blinkRisk = blink ? blink.risk01 : 0.3;
+
+// 4.10 Nombre de archivo
+const nameRisk = filenameRisk(currentFile?.name || '');
+
+// 4.11 ONNX (si está)
+const onnxProb = mean(per.filter(p=>p.onnxProb!=null).map(p=>p.onnxProb)) || null;
+
 
     const metrics = [
-      {key:'onnx',   name:'Modelo IA (ONNX)',    val: onnxProb==null?0:onnxProb},
-      {key:'blink',  name:'Parpadeo anómalo',    val: blinkRisk},
-      {key:'lips',   name:'Labios vs audio',     val: lipsyncRisk},
-      {key:'dct',    name:'Alta frecuencia DCT', val: dctRisk},
-      {key:'skin',   name:'Consistencia de piel',val: skinRisk},
-      {key:'block',  name:'Bloques compresión',  val: blockinessRisk},
-      {key:'sharp',  name:'Nitidez anómala',     val: sharpnessRisk},
-      {key:'name',   name:'Pistas del nombre',   val: nameRisk}
-    ];
+  {key:'onnx',   name:'Modelo IA (ONNX)',       val: onnxProb==null?0:onnxProb, desc:'Salida del clasificador ONNX sobre rostro 224×224 (0 real – 1 fake).'},
+  {key:'flicker',name:'Flicker de brillo',      val: (prof==='aggressive'? flickerRiskAgg : flickerRisk), desc:'U‑shape: variación de luminancia muy baja o muy alta es sospechosa.'},
+  {key:'dct',    name:'Alta frecuencia DCT',    val: dctRisk, desc:'Energía relativa en altas frecuencias (texturas/bordes artificiales).'},
+  {key:'motion', name:'Movimiento “perfecto”',  val: motionJitterRisk, desc:'U‑shape: demasiado estable o muy errático puede ser síntesis.'},
+  {key:'block',  name:'Compresión sospechosa',  val: blockinessRisk, desc:'Promedio alto o compresión excesivamente uniforme.'},
+  {key:'sharp',  name:'Nitidez anómala',        val: sharpnessRisk, desc:'Exceso/falta de nitidez o nitidez demasiado estable.'},
+  {key:'sensor', name:'Ruido de sensor',        val: sensorNoiseRisk, desc:'Ruido muy bajo y constante (sin “grano” real) es sospechoso.'},
+  {key:'skin',   name:'Piel plana',             val: skinFlatRisk, desc:'Bajo contraste y crominancia demasiado estable en la cara.'},
+  {key:'lips',   name:'Labios vs audio',        val: lipsyncRisk, desc:'Baja correlación entre actividad oral y energía de voz.'},
+  {key:'blink',  name:'Parpadeo anómalo',       val: blinkRisk, desc:'Frecuencia de parpadeo fuera de lo fisiológico.'},
+  {key:'name',   name:'Pistas del nombre',      val: nameRisk, desc:'Keywords o resoluciones crudas en el nombre del archivo.'}
+];
 
-    // Weights (ajustables). Damos más peso al modelo si está disponible.
-    const w = onnxProb==null
-      ? { onnx:0, blink:.16, lips:.16, dct:.16, skin:.14, block:.14, sharp:.14, name:.10 }
-      : { onnx:.55, blink:.10, lips:.12, dct:.08, skin:.07, block:.04, sharp:.04, name:.00 };
+// Pesos por perfil (sin/con ONNX)
+let w;
+if (onnxProb==null) {
+  w = (prof==='aggressive')
+    ? { onnx:0, flicker:.12, dct:.14, motion:.12, block:.12, sharp:.12, sensor:.16, skin:.10, lips:.07, blink:.03, name:.02 }
+    : { onnx:0, flicker:.12, dct:.14, motion:.12, block:.12, sharp:.12, sensor:.12, skin:.10, lips:.08, blink:.07, name:.01 };
+} else {
+  w = (prof==='aggressive')
+    ? { onnx:.50, flicker:.07, dct:.08, motion:.07, block:.05, sharp:.05, sensor:.09, skin:.05, lips:.03, blink:.01, name:.00 }
+    : { onnx:.55, flicker:.06, dct:.07, motion:.06, block:.05, sharp:.05, sensor:.07, skin:.05, lips:.03, blink:.01, name:.00 };
+}
 
-    const score01 = clamp(metrics.reduce((acc,m)=> acc + m.val*(w[m.key]||0), 0), 0, 1);
-    const scorePct = Math.round(score01*100);
-    const thr = parseInt(thres.value,10);
-    const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Incierto' : 'Alta sospecha';
+// Score
+const score01 = clamp(metrics.reduce((acc,m)=> acc + m.val*(w[m.key]||0), 0), 0, 1);
+const scorePct = Math.round(score01*100);
+const thr = parseInt(thres.value,10);
+const label = scorePct < (thr-10) ? 'Baja sospecha' : scorePct < (thr+10) ? 'Incierto' : 'Alta sospecha';
+
+// Armar reporte como ya hacías
+
 
     const detail = metrics.map(m=>({ key:m.key, name:m.name, risk01:+m.val.toFixed(3)}));
 
@@ -526,6 +613,49 @@
   const scaleU = (v, lo, hi)=>{ const t = scale(v, lo, hi); return Math.pow(t,0.85); };
   const zscore = arr => { const m=mean(arr), s=stdDev(arr)||1; return arr.map(v=>(v-m)/s); };
   const pearson = (a,b)=>{ const ma=mean(a), mb=mean(b); let num=0,da=0,db=0; for(let i=0;i<a.length;i++){ const x=a[i]-ma, y=b[i]-mb; num+=x*y; da+=x*x; db+=y*y; } return num/Math.sqrt((da||1)*(db||1)); };
+
+  // Normaliza (0..1) diciendo “qué tan bajo” es un valor respecto a un umbral útil
+  const lowRisk = (v, lo, hi) => clamp((hi - v) / Math.max(1e-6, hi - lo), 0, 1);
+
+  // RMS de un vector
+  const rms = arr => Math.sqrt(arr.reduce((a,b)=>a + b*b, 0) / (arr.length||1));
+
+  // High-pass simple para estimar “ruido” del frame (gris)
+  function frameNoiseRMS(img) {
+    const {data,width:w,height:h}=img;
+    // blur 3x3 + resta -> residuo (alto-frecuencia)
+    const toGray = (i)=> 0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    const g = new Float32Array(w*h);
+    for(let i=0,j=0;i<data.length;i+=4,j++) g[j]=toGray(i);
+
+    const idx = (x,y)=> y*w+x;
+    const out = new Float32Array(w*h);
+    for(let y=1;y<h-1;y++){
+      for(let x=1;x<w-1;x++){
+        const b = (
+          g[idx(x-1,y-1)] + g[idx(x,y-1)] + g[idx(x+1,y-1)] +
+          g[idx(x-1,y  )] + g[idx(x,y  )] + g[idx(x+1,y  )] +
+          g[idx(x-1,y+1)] + g[idx(x,y+1)] + g[idx(x+1,y+1)]
+        )/9;
+        out[idx(x,y)] = g[idx(x,y)] - b; // residuo
+      }
+    }
+    // RMS del residuo (escala 0..255)
+    let sum=0,n=0;
+    for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++){ const v=out[idx(x,y)]; sum+=v*v; n++; }
+    return Math.sqrt(sum/Math.max(1,n));
+  }
+
+  // Contraste local aproximado (en cara) usando varianza de luminancia
+  function localContrast(facePatch) {
+    const {data,width:w,height:h}=facePatch;
+    const toGray = (i)=> 0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    const n = w*h;
+    let s=0; for(let i=0;i<data.length;i+=4) s+=toGray(i);
+    const m = s/n;
+    let v=0; for(let i=0;i<data.length;i+=4){ const d=toGray(i)-m; v+=d*d; }
+    return Math.sqrt(v/n); // desviación típica (0..255)
+  }
 
   // =============== Render ===============
   function renderReport(rep){ setGauge(rep.summary.scorePct, rep.summary.label); legendEl.innerHTML=''; rep.metrics.forEach(m=> legendEl.appendChild(metricRow(m.name, Math.round(m.risk01*100)))); }
