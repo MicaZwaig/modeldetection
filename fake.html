@@ -154,10 +154,10 @@
       </div>
     </aside>
   </main>
-
+<!-- 
   <footer>
     Demo educativa. Todo corre localmente. Podés reemplazar el modelo ONNX por otro (Xception/EfficientNet distil) ubicado en <code>CFG.modelUrl</code>.
-  </footer>
+  </footer> -->
 
   <!-- Work canvases -->
   <canvas id="work" width="320" height="180" style="display:none"></canvas>
@@ -228,7 +228,8 @@
       // ONNX Runtime
       session = await ort.InferenceSession.create(CFG.modelUrl, { executionProviders: ['wasm'] });
       modelReady = true; stOnnx.textContent = 'Modelo IA: cargado'; stOnnx.style.borderColor = '#00d39b';
-    }catch(e){ stOnnx.textContent = 'Modelo IA: no disponible (heurístico)'; stOnnx.style.borderColor = '#ffb86b'; }
+    }
+    catch(e){ stOnnx.textContent = ''; stOnnx.style.borderColor = '#ffb86b'; }
 
     try{
       FilesetResolverRef = window.FilesetResolver; FaceLandmarkerRef = window.FaceLandmarker;
@@ -240,7 +241,7 @@
         numFaces: 1
       });
       faceReady = true; stFace.textContent = 'Landmarks: ok'; stFace.style.borderColor = '#00d39b';
-    }catch(e){ stFace.textContent = 'Landmarks: no disponibles'; stFace.style.borderColor = '#ff6b6b'; }
+    }catch(e){ stFace.textContent = ''; stFace.style.borderColor = '#ff6b6b'; }
   })();
 
   // ================== Analysis ==================
